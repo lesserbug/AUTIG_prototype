@@ -1,0 +1,18 @@
+{
+  "key": {
+    "name": "YOUR_EC2_KEY_PAIR_NAME",
+    "path": "/path/to/your/ssh-private-key"
+  },
+  "port": 5000,
+  "repo": {
+    "name": "utig",
+    "url": "https://github.com/lesserbug/AUTIG.git",
+    "branch": "master"
+  },
+  "instances": {
+    "type": "m5.xlarge",
+    "regions": [
+      "us-east-1"
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+# Local credentials and environments
+.env
+.env.*
+!.env.example
+**/keys/
+*.pem
+*.key
+.aws/
+.ssh/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Generated binaries and profiling output
+/bin/
+*.exe
+*.test
+*.test.exe
+*.pprof
+coverage.out
+
+# Private research workspace and runtime artifacts
+/tdsc_revision/
+/tmp/
+/pkg/ofo/PROPOSAL_REGRESSION_RESULTS.md
+/benchmark/DELAY_DIAGNOSIS.md
+/benchmark/.build/
+/benchmark/.runtime/
+/benchmark/logs/
+/benchmark/results/

@@ -1,0 +1,351 @@
+// pkg/network/network.go
+package network
+
+import (
+	"SpeedFair_simplify/pkg/diagnostics"
+	"encoding/gob"
+	"fmt"
+	"log"
+	"net"
+	"sort"
+	"sync"
+	"time"
+)
+
+type NetworkInterface interface {
+	Register(replicaID uint64, handler func(Message))
+	Send(msg Message) bool
+	Stop()
+	WaitForPeers(timeout time.Duration) error // <<< ADDED: 接口
+}
+
+type Message struct {
+	Type    string
+	From    uint64
+	To      uint64
+	Payload interface{}
+}
+
+type NetworkConfig struct {
+	ReplicaID   uint64
+	ReplicaAddr map[uint64]string
+}
+
+type DistributedNetwork struct {
+	// Set before registering the handler or sending benchmark messages.
+	Benchmark    *diagnostics.Mechanism
+	config       NetworkConfig
+	handler      func(Message)
+	connections  map[uint64]*peerConn
+	listener     net.Listener
+	mu           sync.RWMutex
+	stopChan     chan struct{}
+	wg           sync.WaitGroup
+	msgQueue     chan Message
+	workerCount  int
+	connAttempts map[uint64]bool
+	connMu       sync.Mutex
+
+	readyChan chan struct{} // <<< ADDED
+	readyOnce sync.Once     // <<< ADDED
+}
+
+type peerConn struct {
+	conn   net.Conn
+	enc    *gob.Encoder
+	writer *countingWriter
+	mu     sync.Mutex
+}
+
+// Count the existing Gob stream without encoding a second time or buffering it.
+// The peer's send mutex protects this writer after the handshake.
+type countingWriter struct {
+	conn  net.Conn
+	bytes uint64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.conn.Write(p)
+	w.bytes += uint64(n)
+	return n, err
+}
+
+func NewDistributedNetwork(config NetworkConfig) (*DistributedNetwork, error) {
+	n := &DistributedNetwork{
+		config:      config,
+		connections: make(map[uint64]*peerConn),
+		stopChan:    make(chan struct{}),
+		msgQueue:    make(chan Message, 10000),
+		// The FIFO dequeue order of msgQueue is the replica's first-receipt
+		// order, so a handler must not be invoked concurrently.
+		workerCount:  1,
+		connAttempts: make(map[uint64]bool),
+		readyChan:    make(chan struct{}), // <<< ADDED
+	}
+	addr := config.ReplicaAddr[config.ReplicaID]
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("node %d has invalid advertised address %s: %v", config.ReplicaID, addr, err)
+	}
+	listener, err := net.Listen("tcp", net.JoinHostPort("", port))
+	if err != nil {
+		return nil, fmt.Errorf("node %d failed to listen on port %s: %v", config.ReplicaID, port, err)
+	}
+	n.listener = listener
+	for i := 0; i < n.workerCount; i++ {
+		n.wg.Add(1)
+		go n.messageWorker()
+	}
+	n.wg.Add(1)
+	go n.acceptConnections()
+	n.wg.Add(1)
+	go n.connectionManager()
+	return n, nil
+}
+
+func (n *DistributedNetwork) messageWorker() {
+	defer n.wg.Done()
+	for {
+		select {
+		case msg := <-n.msgQueue:
+			if n.handler != nil {
+				n.handler(msg)
+			}
+		case <-n.stopChan:
+			return
+		}
+	}
+}
+
+func (n *DistributedNetwork) acceptConnections() {
+	defer n.wg.Done()
+	for {
+		conn, err := n.listener.Accept()
+		if err != nil {
+			select {
+			case <-n.stopChan:
+				return
+			default:
+				continue
+			}
+		}
+		go n.handleIncomingConnection(conn)
+	}
+}
+
+func (n *DistributedNetwork) handleIncomingConnection(conn net.Conn) {
+	decoder := gob.NewDecoder(conn)
+	writer := &countingWriter{conn: conn}
+	encoder := gob.NewEncoder(writer)
+	var peerID uint64
+	if err := decoder.Decode(&peerID); err != nil {
+		conn.Close()
+		return
+	}
+	n.mu.Lock()
+	if existingConn, exists := n.connections[peerID]; exists {
+		existingConn.conn.Close()
+	}
+	n.connections[peerID] = &peerConn{conn: conn, enc: encoder, writer: writer}
+	n.mu.Unlock()
+	for {
+		var msg Message
+		if err := decoder.Decode(&msg); err != nil {
+			n.mu.Lock()
+			if c, ok := n.connections[peerID]; ok && c.conn == conn {
+				delete(n.connections, peerID)
+			}
+			n.mu.Unlock()
+			conn.Close()
+			return
+		}
+		select {
+		case n.msgQueue <- msg:
+		case <-n.stopChan:
+			return
+		}
+	}
+}
+
+func (n *DistributedNetwork) connectionManager() {
+	defer n.wg.Done()
+	ticker := time.NewTicker(2 * time.Second) // 缩短检查间隔
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			totalPeers := len(n.config.ReplicaAddr) - 1
+			if totalPeers <= 0 { // 如果只有一个节点，直接ready
+				n.readyOnce.Do(func() { close(n.readyChan) })
+				return
+			}
+
+			n.mu.RLock()
+			connectedCount := len(n.connections)
+			n.mu.RUnlock()
+
+			// <<< 检查是否所有节点都已连接 >>>
+			if connectedCount >= totalPeers {
+				n.readyOnce.Do(func() { close(n.readyChan) })
+			} else {
+				// 如果未全部连接，尝试连接尚未连接的节点
+				for replicaID, addr := range n.config.ReplicaAddr {
+					// One dialer per pair; the resulting TCP stream is bidirectional.
+					if replicaID <= n.config.ReplicaID {
+						continue
+					}
+					n.mu.RLock()
+					_, exists := n.connections[replicaID]
+					n.mu.RUnlock()
+					if !exists {
+						go n.tryConnect(replicaID, addr)
+					}
+				}
+			}
+
+		case <-n.stopChan:
+			return
+		}
+	}
+}
+
+func (n *DistributedNetwork) WaitForPeers(timeout time.Duration) error {
+	select {
+	case <-n.readyChan:
+		log.Printf("Node %d: All peers connected.", n.config.ReplicaID)
+		return nil
+	case <-time.After(timeout):
+		n.mu.RLock()
+		var connected, missing []uint64
+		for peerID := range n.config.ReplicaAddr {
+			if peerID == n.config.ReplicaID {
+				continue
+			}
+			if _, ok := n.connections[peerID]; ok {
+				connected = append(connected, peerID)
+			} else {
+				missing = append(missing, peerID)
+			}
+		}
+		n.mu.RUnlock()
+		sort.Slice(connected, func(i, j int) bool { return connected[i] < connected[j] })
+		sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+		return fmt.Errorf("node %d timed out waiting for peers. Connected to %d/%d; connected peers=%v; missing peers=%v", n.config.ReplicaID, len(connected), len(n.config.ReplicaAddr)-1, connected, missing)
+	}
+}
+
+func (n *DistributedNetwork) tryConnect(replicaID uint64, addr string) {
+	if replicaID <= n.config.ReplicaID {
+		return
+	}
+	select {
+	case <-n.stopChan:
+		return
+	default:
+	}
+	n.connMu.Lock()
+	if n.connAttempts[replicaID] {
+		n.connMu.Unlock()
+		return
+	}
+	n.connAttempts[replicaID] = true
+	n.connMu.Unlock()
+	defer func() { n.connMu.Lock(); n.connAttempts[replicaID] = false; n.connMu.Unlock() }()
+	n.mu.RLock()
+	_, connected := n.connections[replicaID]
+	n.mu.RUnlock()
+	if connected {
+		return
+	}
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		log.Printf("Node %d failed to connect to peer %d at %s: %v", n.config.ReplicaID, replicaID, addr, err)
+		return
+	}
+	writer := &countingWriter{conn: conn}
+	encoder := gob.NewEncoder(writer)
+	decoder := gob.NewDecoder(conn)
+	if err = encoder.Encode(n.config.ReplicaID); err != nil {
+		log.Printf("Node %d failed to send handshake to peer %d at %s: %v", n.config.ReplicaID, replicaID, addr, err)
+		conn.Close()
+		return
+	}
+	n.mu.Lock()
+	if existingConn, exists := n.connections[replicaID]; exists {
+		existingConn.conn.Close()
+	}
+	n.connections[replicaID] = &peerConn{conn: conn, enc: encoder, writer: writer}
+	n.mu.Unlock()
+	for {
+		var msg Message
+		if err := decoder.Decode(&msg); err != nil {
+			n.mu.Lock()
+			if c, ok := n.connections[replicaID]; ok && c.conn == conn {
+				delete(n.connections, replicaID)
+			}
+			n.mu.Unlock()
+			conn.Close()
+			return
+		}
+		select {
+		case n.msgQueue <- msg:
+		case <-n.stopChan:
+			return
+		}
+	}
+}
+
+func (n *DistributedNetwork) Register(replicaID uint64, handler func(Message)) {
+	if replicaID == n.config.ReplicaID {
+		n.handler = handler
+	}
+}
+
+func (n *DistributedNetwork) Send(msg Message) (success bool) {
+	var written uint64
+	defer func() { n.Benchmark.Network(msg.Type, msg.To == n.config.ReplicaID, success, written) }()
+	if msg.To == n.config.ReplicaID {
+		select {
+		case n.msgQueue <- msg:
+			return true
+		default:
+			return false
+		}
+	}
+	n.mu.RLock()
+	pc, ok := n.connections[msg.To]
+	n.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	before := pc.writer.bytes
+	defer func() { written = pc.writer.bytes - before }()
+	// Bound blocked writes so benchmark shutdown cannot wait indefinitely.
+	_ = pc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := pc.enc.Encode(msg); err != nil {
+		n.mu.Lock()
+		if c, ok := n.connections[msg.To]; ok && c == pc {
+			delete(n.connections, msg.To)
+		}
+		n.mu.Unlock()
+		pc.conn.Close()
+		return false
+	}
+	return true
+}
+
+func (n *DistributedNetwork) Stop() {
+	close(n.stopChan)
+	if n.listener != nil {
+		n.listener.Close()
+	}
+	n.mu.Lock()
+	for _, pc := range n.connections {
+		pc.conn.Close()
+	}
+	n.mu.Unlock()
+	n.wg.Wait()
+}
