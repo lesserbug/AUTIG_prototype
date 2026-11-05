@@ -1,31 +1,43 @@
-# Local credentials and environments
-.env
-.env.*
-!.env.example
-**/keys/
-*.pem
-*.key
-.aws/
-.ssh/
-.venv/
-venv/
-__pycache__/
-*.py[cod]
+# Local credentials and machine-specific configuration
+/config.json
+/keys/
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.keystore
+**/.env
+**/.env.*
+**/node_key.json
+**/priv_validator_key.json
+**/priv_validator_state.json
 
-# Generated binaries and profiling output
-/bin/
-*.exe
-*.test
-*.test.exe
-*.pprof
-coverage.out
+# Generated experiments, databases, binaries and profiles
+/runtime/
+/results/
+/logs/
+/comet_nodes/
+**/*.exe
+**/*.test
+**/*.out
+**/*.pprof
+**/*.prof
+**/*.log
+**/*.csv
+**/*.jsonl
+**/*.zip
+**/*.tar
+**/*.gz
+**/*.db
+**/*.db/
 
-# Private research workspace and runtime artifacts
-/tdsc_revision/
-/tmp/
-/pkg/ofo/PROPOSAL_REGRESSION_RESULTS.md
-/benchmark/DELAY_DIAGNOSIS.md
-/benchmark/.build/
-/benchmark/.runtime/
-/benchmark/logs/
-/benchmark/results/
+# Language/editor caches and local workspaces
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/.idea/
+**/.vscode/
+go.work
+go.work.sum
+.DS_Store
+Thumbs.db

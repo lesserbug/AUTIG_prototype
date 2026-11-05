@@ -50,14 +50,16 @@ const (
 func main() {
 	// --- 1. 添加新的命令行标志，并使用常量作为默认值 ---
 	var (
-		configFile       = flag.String("config", "config.json", "JSON config file for node addresses")
-		nodeList         = flag.String("nodes", "", "Comma-separated list of node IDs to run on this instance")
-		cpuProfile       = flag.Bool("cpuprofile", false, "Enable CPU profiling for this instance")
-		stageTiming      = flag.Bool("stage-timing", false, "Log per-fragment benchmark stage timing")
-		faultCount       = flag.Uint64("f", 2, "Number of tolerated faulty replicas")
-		byzantineCount   = flag.Int64("byzantine-count", -1, "Actual malicious LO producers (default: f; must be between 0 and f)")
-		byzantineLODelay = flag.Duration("byzantine-lo-delay", 0, "Extra wait before each malicious LO generation/send attempt, e.g. 200ms")
-		gamma            = flag.Float64("gamma", 0.90, "Fairness parameter gamma")
+		configFile        = flag.String("config", "config.json", "JSON config file for node addresses")
+		nodeList          = flag.String("nodes", "", "Comma-separated list of node IDs to run on this instance")
+		cpuProfile        = flag.Bool("cpuprofile", false, "Enable CPU profiling for this instance")
+		stageTiming       = flag.Bool("stage-timing", false, "Log per-fragment benchmark stage timing")
+		faultCount        = flag.Uint64("f", 2, "Number of tolerated faulty replicas")
+		byzantineCount    = flag.Int64("byzantine-count", -1, "Actual malicious LO producers (default: f; must be between 0 and f)")
+		byzantineLODelay  = flag.Duration("byzantine-lo-delay", 0, "Extra wait before each malicious LO generation/send attempt, e.g. 200ms")
+		gamma             = flag.Float64("gamma", 0.90, "Fairness parameter gamma")
+		continuationDelay = flag.Int("continuation-delay", 2, "Certified continuation delay in committed fragments; -1 selects archived closed-only policy")
+		verificationMode  = flag.String("verification-mode", "certificate", "Follower validation: certificate, incremental-undo, or reconstruction")
 
 		// <<< 新增的标志，用于控制批次大小 >>>
 		loInterval  = flag.Int("lo-interval", LO_GENERATION_INTERVAL_MS_DEFAULT, "Interval in milliseconds for generating local orders")
@@ -143,11 +145,25 @@ func main() {
 	}()
 
 	// The experiment timeout starts only after every replica handler is ready.
-	runDistributedMode(ctx, nodesToRun, maliciousThresholdID, config, totalNodesFromConfig, *faultCount, *gamma, *loInterval, *loSize, *txRate, *txSize, *simDuration, authenticator, authContext, genesis, *byzantineLODelay)
+	mode := ofo.StructuralVerification
+	switch *verificationMode {
+	case "certificate":
+	case "incremental-undo":
+		mode = ofo.SymmetricIncrementalVerification
+	case "reconstruction":
+		mode = ofo.ReconstructionVerification
+	default:
+		log.Fatal("Unknown verification mode")
+	}
+	if *continuationDelay < -1 {
+		log.Fatal("Invalid continuation delay")
+	}
+	fmt.Printf("AUTIG policy continuation_delay=%d verification_mode=%s\n", *continuationDelay, *verificationMode)
+	runDistributedMode(ctx, nodesToRun, maliciousThresholdID, config, totalNodesFromConfig, *faultCount, *gamma, *loInterval, *loSize, *txRate, *txSize, *simDuration, authenticator, authContext, genesis, *byzantineLODelay, *continuationDelay, mode)
 }
 
 // <<< MODIFIED: 函数签名接收 maliciousThresholdID >>>
-func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThresholdID uint64, config map[uint64]string, totalNodes, faultCount uint64, gamma float64, loIntervalMs, loSize, txRate, txSize, simDuration int, authenticator types.Authenticator, authContext types.AuthContext, genesis types.ProtocolGenesis, byzantineLODelay time.Duration) {
+func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThresholdID uint64, config map[uint64]string, totalNodes, faultCount uint64, gamma float64, loIntervalMs, loSize, txRate, txSize, simDuration int, authenticator types.Authenticator, authContext types.AuthContext, genesis types.ProtocolGenesis, byzantineLODelay time.Duration, continuationDelay int, mode ofo.VerificationMode) {
 	ctx, cancel := context.WithCancel(rootCtx)
 	defer cancel()
 
@@ -224,6 +240,14 @@ func runDistributedMode(rootCtx context.Context, nodeIDs []uint64, maliciousThre
 				return
 			}
 			defer service.Stop()
+			if continuationDelay >= 0 {
+				if err := service.EnableContinuation(uint64(continuationDelay)); err != nil {
+					log.Fatal(err)
+				}
+			}
+			if err := service.SetVerificationMode(mode); err != nil {
+				log.Fatal(err)
+			}
 			net.Benchmark = service.Benchmark
 			if hosting != nil {
 				hosting.leader = service

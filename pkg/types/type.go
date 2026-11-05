@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
-	"math"
+	"math/big"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -115,6 +116,10 @@ type StructuralCertificate struct {
 // VerifiableFairOrderFragment is a hosting-BFT proposal. Its signature and
 // digest use the canonical encodings below; gob is only the transport encoding.
 type VerifiableFairOrderFragment struct {
+	ProtocolVersion          uint64
+	PolicyID                 [32]byte
+	Continuation             *ContinuationTransition
+	ContinuationProof        *ContinuationCertificate
 	Epoch                    uint64
 	AuthContextID            [32]byte
 	LeaderID                 uint64
@@ -136,9 +141,28 @@ type SCCInfo struct {
 	TopoIndex int
 }
 
+// CalculateHonestThreshold interprets the configured decimal gamma exactly.
+// Binary multiplication can round an integer product upward before Ceil,
+// admitting a mathematically infeasible quorum (for example .56 * 25).
+func CalculateHonestThreshold(n, f uint64, gamma float64) uint64 {
+	if f >= n {
+		return 0
+	}
+	g, ok := new(big.Rat).SetString(strconv.FormatFloat(gamma, 'g', -1, 64))
+	if !ok || g.Sign() <= 0 || g.Cmp(big.NewRat(1, 1)) > 0 {
+		return 0
+	}
+	g.Mul(g, new(big.Rat).SetInt(new(big.Int).SetUint64(n-f)))
+	q, remainder := new(big.Int), new(big.Int)
+	q.QuoRem(g.Num(), g.Denom(), remainder)
+	if remainder.Sign() > 0 {
+		q.Add(q, big.NewInt(1))
+	}
+	return q.Uint64()
+}
+
 func CalculateEdgeThreshold(n, f uint64, gamma float64) int {
-	qH := int(math.Ceil(gamma * float64(n-f)))
-	return int(n) - qH + 1
+	return int(n) - int(CalculateHonestThreshold(n, f, gamma)) + 1
 }
 
 func CalculateSolidThreshold(n, f uint64) int {
@@ -208,7 +232,7 @@ func PostStateIdentifier(epoch, fragmentSeq uint64, preStateID [32]byte, finalOr
 	writeUint64(&b, fragmentSeq)
 	b.Write(preStateID[:])
 	if finalOrder == nil {
-		writeUint64(&b, 0)
+		writeUint64(&b, ^uint64(0)) // reserved invalid-object marker; not an empty vector
 	} else {
 		writeUint64(&b, uint64(len(finalOrder.Batches)))
 		for _, batch := range finalOrder.Batches {
@@ -226,7 +250,15 @@ func PostStateIdentifier(epoch, fragmentSeq uint64, preStateID [32]byte, finalOr
 
 func FragmentDigest(fragment *VerifiableFairOrderFragment) [32]byte {
 	var b bytes.Buffer
-	b.WriteString("AUTIG/fragment/v1")
+	if fragment.ProtocolVersion == 0 && fragment.PolicyID == ([32]byte{}) && fragment.Continuation == nil && fragment.ContinuationProof == nil {
+		b.WriteString("AUTIG/fragment/v1")
+	} else {
+		b.WriteString("AUTIG/fragment/v2")
+		writeUint64(&b, fragment.ProtocolVersion)
+		b.Write(fragment.PolicyID[:])
+		writeContinuation(&b, fragment.Continuation)
+		writeContinuationCertificate(&b, fragment.ContinuationProof)
+	}
 	writeUint64(&b, fragment.Epoch)
 	b.Write(fragment.AuthContextID[:])
 	writeUint64(&b, fragment.LeaderID)
@@ -238,7 +270,7 @@ func FragmentDigest(fragment *VerifiableFairOrderFragment) [32]byte {
 		writeLocalOrder(&b, order)
 	}
 	if fragment.FinalOrder == nil {
-		writeUint64(&b, 0)
+		writeUint64(&b, ^uint64(0)) // nil must not alias a valid authenticated empty output
 	} else {
 		writeUint64(&b, uint64(len(fragment.FinalOrder.Batches)))
 		for _, batch := range fragment.FinalOrder.Batches {
@@ -254,7 +286,7 @@ func FragmentDigest(fragment *VerifiableFairOrderFragment) [32]byte {
 
 func writeCertificate(b *bytes.Buffer, certificate *StructuralCertificate) {
 	if certificate == nil {
-		writeUint64(b, 0)
+		writeUint64(b, ^uint64(0)) // nil must not alias an empty structural certificate
 		writeUint64(b, 0)
 		return
 	}

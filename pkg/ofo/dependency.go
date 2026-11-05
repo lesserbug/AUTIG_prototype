@@ -3,7 +3,6 @@ package ofo
 import (
 	"SpeedFair_simplify/pkg/types"
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -25,13 +24,17 @@ func makePair(u, v types.TxID) pairKey {
 }
 
 type DoneRecord struct {
-	FragmentSeq uint64
-	BatchIndex  uint64
+	FragmentSeq      uint64
+	BatchIndex       uint64
+	HistoryIndex     uint64
+	ExecutionSeq     uint64
+	ExecutionOrdinal uint64
 }
 
 // EvidenceState is authoritative. visibility, weights and states are
 // deterministic caches and are deliberately excluded from StateID.
 type EvidenceState struct {
+	QueryCounts          *PredicateCounts
 	Epoch                uint64
 	FragmentSeq          uint64
 	FairnessBatchCounter uint64
@@ -41,7 +44,14 @@ type EvidenceState struct {
 	TxRef                map[types.TxID]types.TxID
 	Pos                  map[uint64]map[types.TxID]uint64
 	Done                 map[types.TxID]DoneRecord
+	doneBase             *doneIndex
+	doneVersion          uint64
+	doneBaseCount        int
+	doneOrder            []types.TxID
 	DoneRoot             [32]byte
+	OpenBatch            uint64
+	OpenMembers          map[types.TxID]ExecutionRecord
+	SolidSince           map[types.TxID]uint64
 	StateID              [32]byte
 	visibility           map[types.TxID]int
 	weights              map[edgeKey]int
@@ -50,22 +60,24 @@ type EvidenceState struct {
 
 func NewEvidenceState(epoch uint64, replicaCount uint64, genesisStateID [32]byte) *EvidenceState {
 	state := &EvidenceState{
-		Epoch:      epoch,
-		Seq:        make(map[uint64]uint64, replicaCount),
-		Head:       make(map[uint64][32]byte, replicaCount),
-		Live:       make(map[types.TxID]bool),
-		TxRef:      make(map[types.TxID]types.TxID),
-		Pos:        make(map[uint64]map[types.TxID]uint64, replicaCount),
-		Done:       make(map[types.TxID]DoneRecord),
-		visibility: make(map[types.TxID]int),
-		weights:    make(map[edgeKey]int),
-		states:     make(map[types.TxID]types.TxState),
-		StateID:    genesisStateID,
+		Epoch:       epoch,
+		Seq:         make(map[uint64]uint64, replicaCount),
+		Head:        make(map[uint64][32]byte, replicaCount),
+		Live:        make(map[types.TxID]bool),
+		TxRef:       make(map[types.TxID]types.TxID),
+		Pos:         make(map[uint64]map[types.TxID]uint64, replicaCount),
+		Done:        make(map[types.TxID]DoneRecord),
+		doneBase:    &doneIndex{records: make(map[types.TxID]DoneRecord)},
+		visibility:  make(map[types.TxID]int),
+		weights:     make(map[edgeKey]int),
+		states:      make(map[types.TxID]types.TxState),
+		OpenMembers: make(map[types.TxID]ExecutionRecord), SolidSince: make(map[types.TxID]uint64),
+		StateID: genesisStateID,
 	}
 	for replicaID := uint64(0); replicaID < replicaCount; replicaID++ {
 		state.Pos[replicaID] = make(map[types.TxID]uint64)
 	}
-	state.DoneRoot = finalizedSetRoot(state.Done)
+	state.DoneRoot = emptyDoneRoot()
 	return state
 }
 
@@ -81,10 +93,22 @@ func (state *EvidenceState) clone() *EvidenceState {
 		Pos:                  make(map[uint64]map[types.TxID]uint64, len(state.Pos)),
 		Done:                 make(map[types.TxID]DoneRecord, len(state.Done)),
 		DoneRoot:             state.DoneRoot,
-		StateID:              state.StateID,
-		visibility:           make(map[types.TxID]int, len(state.visibility)),
-		weights:              make(map[edgeKey]int, len(state.weights)),
-		states:               make(map[types.TxID]types.TxState, len(state.states)),
+		doneBase:             state.doneBase, doneVersion: state.doneVersion, doneBaseCount: state.doneBaseCount,
+		doneOrder:  append([]types.TxID(nil), state.doneOrder...),
+		StateID:    state.StateID,
+		visibility: make(map[types.TxID]int, len(state.visibility)),
+		weights:    make(map[edgeKey]int, len(state.weights)),
+		states:     make(map[types.TxID]types.TxState, len(state.states)),
+	}
+	copyState.QueryCounts = state.QueryCounts
+	copyState.OpenBatch = state.OpenBatch
+	copyState.OpenMembers = make(map[types.TxID]ExecutionRecord, len(state.OpenMembers))
+	copyState.SolidSince = make(map[types.TxID]uint64, len(state.SolidSince))
+	for id, record := range state.OpenMembers {
+		copyState.OpenMembers[id] = record
+	}
+	for id, seq := range state.SolidSince {
+		copyState.SolidSince[id] = seq
 	}
 	for id, value := range state.Seq {
 		copyState.Seq[id] = value
@@ -119,24 +143,6 @@ func (state *EvidenceState) clone() *EvidenceState {
 	return copyState
 }
 
-func finalizedSetRoot(done map[types.TxID]DoneRecord) [32]byte {
-	var b bytes.Buffer
-	b.WriteString("AUTIG/finalized-set")
-	ids := make([]types.TxID, 0, len(done))
-	for id := range done {
-		ids = append(ids, id)
-	}
-	types.SortTxIDs(ids)
-	writeU64(&b, uint64(len(ids)))
-	for _, id := range ids {
-		record := done[id]
-		b.Write(id[:])
-		writeU64(&b, record.FragmentSeq)
-		writeU64(&b, record.BatchIndex)
-	}
-	return sha256.Sum256(b.Bytes())
-}
-
 func writeU64(b *bytes.Buffer, value uint64) {
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], value)
@@ -152,12 +158,12 @@ func sortedSet(set map[types.TxID]bool) []types.TxID {
 	return ids
 }
 
-func applyEvidence(state *EvidenceState, orders []*types.LocalOrder, epoch, fragmentSeq, n, f uint64, gamma float64, maxOrderSize int, auth types.Authenticator, admission types.TransactionAdmission) (map[types.TxID]bool, map[pairKey]bool, error) {
-	return applyEvidenceWithTouches(state, orders, epoch, fragmentSeq, n, f, gamma, maxOrderSize, auth, admission, true)
+func applyEvidence(state *EvidenceState, orders []*types.LocalOrder, epoch, fragmentSeq, n, f uint64, gamma float64, maxOrderSize int, auth types.Authenticator, admission types.TransactionAdmission, observer ...func(types.TxID)) (map[types.TxID]bool, map[pairKey]bool, error) {
+	return applyEvidenceWithTouches(state, orders, epoch, fragmentSeq, n, f, gamma, maxOrderSize, auth, admission, true, observer...)
 }
 
 // Followers need the same validated state, but not the graph-refresh pair set.
-func applyEvidenceWithTouches(state *EvidenceState, orders []*types.LocalOrder, epoch, fragmentSeq, n, f uint64, gamma float64, maxOrderSize int, auth types.Authenticator, admission types.TransactionAdmission, collectGraphTouches bool) (map[types.TxID]bool, map[pairKey]bool, error) {
+func applyEvidenceWithTouches(state *EvidenceState, orders []*types.LocalOrder, epoch, fragmentSeq, n, f uint64, gamma float64, maxOrderSize int, auth types.Authenticator, admission types.TransactionAdmission, collectGraphTouches bool, observer ...func(types.TxID)) (map[types.TxID]bool, map[pairKey]bool, error) {
 	if fragmentSeq != state.FragmentSeq+1 {
 		return nil, nil, fmt.Errorf("fragment sequence %d does not extend %d", fragmentSeq, state.FragmentSeq)
 	}
@@ -178,51 +184,13 @@ func applyEvidenceWithTouches(state *EvidenceState, orders []*types.LocalOrder, 
 			return nil, nil, fmt.Errorf("duplicate evidence sender %d", order.ReplicaID)
 		}
 		senders[order.ReplicaID] = true
-		if order.ReplicaID >= n || order.Epoch != epoch || order.FragmentSeq != fragmentSeq {
-			return nil, nil, fmt.Errorf("local order context mismatch for replica %d", order.ReplicaID)
+		refs, err := validateReport(state, order, epoch, fragmentSeq, n, maxOrderSize, auth, admission, observer...)
+		if err != nil {
+			return nil, nil, err
 		}
-		if len(order.OrderedTxs) > maxOrderSize {
-			return nil, nil, fmt.Errorf("local order from replica %d exceeds size limit", order.ReplicaID)
-		}
-		if order.NewPosition != order.PrevPosition+uint64(len(order.OrderedTxs)) {
-			return nil, nil, fmt.Errorf("local order positions are not contiguous for replica %d", order.ReplicaID)
-		}
-		if order.PrevPosition != state.Seq[order.ReplicaID] || order.PrevHead != state.Head[order.ReplicaID] {
-			return nil, nil, fmt.Errorf("local order predecessor mismatch for replica %d", order.ReplicaID)
-		}
-		if order.NewHead != types.LocalOrderHead(order) {
-			return nil, nil, fmt.Errorf("local order hash-chain head mismatch for replica %d", order.ReplicaID)
-		}
-		if !auth.VerifyReplica(order.ReplicaID, types.LocalOrderDigest(order), order.Signature) {
-			return nil, nil, fmt.Errorf("invalid local order signature for replica %d", order.ReplicaID)
-		}
-		seen := make(map[types.TxID]bool, len(order.OrderedTxs))
-		for _, id := range order.OrderedTxs {
-			if seen[id] {
-				return nil, nil, fmt.Errorf("duplicate identifier in replica %d extension", order.ReplicaID)
-			}
-			seen[id] = true
-			if _, finalized := state.Done[id]; finalized {
-				continue
-			}
-			if _, exists := state.Pos[order.ReplicaID][id]; exists {
-				return nil, nil, fmt.Errorf("replica %d assigned a second live first position", order.ReplicaID)
-			}
-			canonical, reference, err := admission.Resolve(id)
-			if err != nil {
-				return nil, nil, fmt.Errorf("transaction %x is unavailable: %w", id, err)
-			}
-			if types.TransactionID(canonical) != id || reference != id {
-				return nil, nil, fmt.Errorf("transaction %x has an invalid content commitment", id)
-			}
-			if err := admission.ValidateAdmission(canonical); err != nil {
-				return nil, nil, fmt.Errorf("transaction %x failed admission: %w", id, err)
-			}
-			if previous, exists := state.TxRef[id]; exists && previous != reference {
-				return nil, nil, fmt.Errorf("transaction %x changed content reference", id)
-			}
-			if previous, exists := resolved[id]; exists && previous != reference {
-				return nil, nil, fmt.Errorf("transaction %x has inconsistent content references", id)
+		for id, reference := range refs {
+			if old, exists := resolved[id]; exists && old != reference {
+				return nil, nil, fmt.Errorf("inconsistent transaction reference")
 			}
 			resolved[id] = reference
 		}
@@ -248,7 +216,7 @@ func applyEvidenceWithTouches(state *EvidenceState, orders []*types.LocalOrder, 
 		position := order.PrevPosition
 		for _, id := range order.OrderedTxs {
 			position++
-			if _, finalized := state.Done[id]; finalized {
+			if _, finalized := state.doneLookup(id); finalized {
 				continue
 			}
 			if !state.Live[id] {
@@ -433,12 +401,13 @@ func (dm *DependencyManager) graph() *types.DependencyGraph {
 }
 
 func (dm *DependencyManager) buildProposal(state *EvidenceState) (*types.FairOrderFragment, *types.StructuralCertificate, error) {
-	graph := dm.graph()
-	if len(graph.Nodes) == 0 {
+	return dm.buildProposalMode(state, true)
+}
+func (dm *DependencyManager) buildProposalMode(state *EvidenceState, withProof bool) (*types.FairOrderFragment, *types.StructuralCertificate, error) {
+	if len(dm.nodes) == 0 {
 		return &types.FairOrderFragment{}, &types.StructuralCertificate{}, nil
 	}
-	sccs := TarjanSCC(graph)
-	condensation, nodeToSCC, infos := BuildCondensationAndSCCInfo(graph, sccs, state.states)
+	condensation, nodeToSCC, infos := decomposeView(dm.nodes, dm.edges, state.states)
 	all := topoSortCondensation(condensation, infos, nil)
 	unsafe := make(map[int]bool)
 	for index, info := range infos {
@@ -467,18 +436,21 @@ func (dm *DependencyManager) buildProposal(state *EvidenceState) (*types.FairOrd
 	for rank, index := range ordered {
 		transactions := append([]types.TxID(nil), infos[index].Txs...)
 		types.SortTxIDs(transactions)
-		certificate.Part = append(certificate.Part, types.SCCClaim{
-			Transactions: transactions,
-			InTree:       spanningTree(transactions[0], transactions, dm.inverseEdges, true),
-			OutTree:      spanningTree(transactions[0], transactions, dm.edges, false),
-			Rank:         uint64(rank),
-		})
+		claim := types.SCCClaim{Transactions: transactions, Rank: uint64(rank)}
+		if withProof {
+			claim.InTree = spanningTree(transactions[0], transactions, dm.inverseEdges, true)
+			claim.OutTree = spanningTree(transactions[0], transactions, dm.edges, false)
+		}
+		certificate.Part = append(certificate.Part, claim)
+
 		finalOrder.Batches = append(finalOrder.Batches, types.FairnessBatch{
 			Index:        state.FairnessBatchCounter + uint64(rank) + 1,
 			Transactions: transactions,
 		})
 	}
-	certificate.BlockForest = dm.blockForest(state, selected, nodeToSCC)
+	if withProof {
+		certificate.BlockForest = dm.blockForest(state, selected, nodeToSCC)
+	}
 	return finalOrder, certificate, nil
 }
 
@@ -559,6 +531,9 @@ func (dm *DependencyManager) blockForest(state *EvidenceState, selected map[int]
 		}
 		current := id
 		for {
+			if used[current] {
+				break
+			}
 			used[current] = true
 			if roots[current] {
 				break
@@ -581,29 +556,17 @@ func (dm *DependencyManager) blockForest(state *EvidenceState, selected map[int]
 
 func finalize(state *EvidenceState, manager *DependencyManager, finalOrder *types.FairOrderFragment, part []types.SCCClaim) {
 	finalized := make(map[types.TxID]bool)
+	ordinal := uint64(0)
 	for _, batch := range finalOrder.Batches {
 		for _, id := range batch.Transactions {
-			state.Done[id] = DoneRecord{FragmentSeq: state.FragmentSeq, BatchIndex: batch.Index}
+			ordinal++
+			state.addDone(id, DoneRecord{FragmentSeq: state.FragmentSeq, BatchIndex: batch.Index, ExecutionSeq: state.FragmentSeq, ExecutionOrdinal: ordinal})
 			finalized[id] = true
 		}
 		state.FairnessBatchCounter = batch.Index
 	}
-	for id := range finalized {
-		delete(state.Live, id)
-		delete(state.TxRef, id)
-		delete(state.visibility, id)
-		delete(state.states, id)
-		for _, positions := range state.Pos {
-			delete(positions, id)
-		}
-	}
-	for key := range state.weights {
-		if finalized[key.u] || finalized[key.v] {
-			delete(state.weights, key)
-		}
-	}
-	manager.removeFinalized(finalized)
-	state.DoneRoot = finalizedSetRoot(state.Done)
+	retireEvidence(state, manager, finalized)
+
 	state.StateID = types.PostStateIdentifier(state.Epoch, state.FragmentSeq, state.StateID, finalOrder, part)
 }
 
@@ -769,7 +732,7 @@ func verifyStructuralCertificate(state *EvidenceState, finalOrder *types.FairOrd
 			if included[id] {
 				return fmt.Errorf("duplicate included identifier")
 			}
-			if _, done := state.Done[id]; done || !active[id] || state.states[id] != types.StateSolid {
+			if _, done := state.doneLookup(id); done || !active[id] || state.states[id] != types.StateSolid {
 				return fmt.Errorf("included transaction is not a live active Solid transaction")
 			}
 			if index > 0 && !types.LessTxID(batch.Transactions[index-1], id) {
@@ -781,65 +744,8 @@ func verifyStructuralCertificate(state *EvidenceState, finalOrder *types.FairOrd
 	if len(certificate.Part) != len(finalOrder.Batches) {
 		return fmt.Errorf("claimed partition does not match fairness batches")
 	}
-	componentOf := make(map[types.TxID]int, len(included))
-	for index, claim := range certificate.Part {
-		if claim.Rank != uint64(index) || !sameIDs(claim.Transactions, finalOrder.Batches[index].Transactions) || len(claim.Transactions) == 0 {
-			return fmt.Errorf("claimed SCC rank or membership mismatch")
-		}
-		for _, id := range claim.Transactions {
-			if _, exists := componentOf[id]; exists {
-				return fmt.Errorf("identifier appears in multiple claimed SCCs")
-			}
-			componentOf[id] = index
-		}
-		if err := verifyClaimedTrees(state, claim, threshold); err != nil {
-			return err
-		}
-	}
-	if len(componentOf) != len(included) {
-		return fmt.Errorf("claimed SCC partition is incomplete")
-	}
-
-	condensation := make(map[int][]int, len(certificate.Part))
-	seenCross := make(map[[2]int]bool)
-	ids := sortedSet(included)
-	for i := 0; i < len(ids); i++ {
-		for j := i + 1; j < len(ids); j++ {
-			u, v := ids[i], ids[j]
-			from, to, exists := selectedEdge(state, u, v, threshold)
-			if !exists {
-				continue
-			}
-			fromComponent, toComponent := componentOf[from], componentOf[to]
-			if fromComponent == toComponent {
-				continue
-			}
-			if fromComponent >= toComponent {
-				return fmt.Errorf("cross-component edge does not increase rank")
-			}
-			key := [2]int{fromComponent, toComponent}
-			if !seenCross[key] {
-				seenCross[key] = true
-				condensation[fromComponent] = append(condensation[fromComponent], toComponent)
-			}
-		}
-	}
-	for index := range certificate.Part {
-		if _, ok := condensation[index]; !ok {
-			condensation[index] = nil
-		}
-	}
-	infos := make(map[int]types.SCCInfo, len(certificate.Part))
-	selectedComponents := make(map[int]bool, len(certificate.Part))
-	for index, claim := range certificate.Part {
-		infos[index] = types.SCCInfo{ID: index, Txs: claim.Transactions, IsSolid: true}
-		selectedComponents[index] = true
-	}
-	ordered := topoSortCondensation(condensation, infos, selectedComponents)
-	for rank, component := range ordered {
-		if component != rank {
-			return fmt.Errorf("claimed ranks do not match deterministic Kahn order")
-		}
+	if err := verifyComponentPartition(state, finalOrder, certificate.Part, included, threshold); err != nil {
+		return err
 	}
 
 	for outside := range active {
@@ -847,6 +753,9 @@ func verifyStructuralCertificate(state *EvidenceState, finalOrder *types.FairOrd
 			continue
 		}
 		for inside := range included {
+			if state.QueryCounts != nil {
+				state.QueryCounts.FrontierPairs++
+			}
 			if localEdgePred(state, outside, inside, threshold) {
 				return fmt.Errorf("selected set has an incoming active frontier edge")
 			}
@@ -868,8 +777,14 @@ func sameIDs(a, b []types.TxID) bool {
 }
 
 func localEdgePred(state *EvidenceState, u, v types.TxID, threshold int) bool {
+	if state.QueryCounts != nil {
+		state.QueryCounts.DirectionalCalls++
+	}
 	if state.states[u] == types.StateBlank || state.states[v] == types.StateBlank {
 		return false
+	}
+	if state.QueryCounts != nil {
+		state.QueryCounts.WeightReads += 2
 	}
 	return edgePred(u, v, state.weights[edgeKey{u, v}], state.weights[edgeKey{v, u}], threshold)
 }
@@ -903,6 +818,9 @@ func verifyTree(state *EvidenceState, root types.TxID, component map[types.TxID]
 	adjacency := make(map[types.TxID][]types.TxID)
 	parentCount := make(map[types.TxID]int)
 	for _, edge := range tree {
+		if state.QueryCounts != nil {
+			state.QueryCounts.WitnessEdges++
+		}
 		if !component[edge.From] || !component[edge.To] || !localEdgePred(state, edge.From, edge.To, threshold) {
 			return fmt.Errorf("certificate tree contains a non-local EdgePred edge")
 		}
@@ -964,6 +882,9 @@ func verifyBlockForest(state *EvidenceState, active, included map[types.TxID]boo
 			continue
 		}
 		parent, ok := recordByID[record.Parent]
+		if state.QueryCounts != nil {
+			state.QueryCounts.WitnessEdges++
+		}
 		if !ok || record.Depth != parent.Depth+1 || !localEdgePred(state, record.Parent, record.Vertex, threshold) {
 			return fmt.Errorf("invalid block forest parent edge or depth")
 		}
@@ -975,6 +896,11 @@ func verifyBlockForest(state *EvidenceState, active, included map[types.TxID]boo
 		}
 		current := id
 		for {
+			// Every path was checked above. A previously visited vertex already
+			// has a verified path to a Shaded root; traverse shared suffixes once.
+			if used[current] {
+				break
+			}
 			record, ok := recordByID[current]
 			if !ok {
 				return fmt.Errorf("excluded Solid transaction has no blocker path")
@@ -990,4 +916,94 @@ func verifyBlockForest(state *EvidenceState, active, included map[types.TxID]boo
 		return fmt.Errorf("block forest contains records outside certified paths")
 	}
 	return nil
+}
+
+func verifyComponentPartition(state *EvidenceState, finalOrder *types.FairOrderFragment, part []types.SCCClaim, included map[types.TxID]bool, threshold int) error {
+	componentOf := make(map[types.TxID]int, len(included))
+	for index, claim := range part {
+		if claim.Rank != uint64(index) || !sameIDs(claim.Transactions, finalOrder.Batches[index].Transactions) || len(claim.Transactions) == 0 {
+			return fmt.Errorf("claimed SCC rank or membership mismatch")
+		}
+		for _, id := range claim.Transactions {
+			if _, exists := componentOf[id]; exists {
+				return fmt.Errorf("identifier appears in multiple claimed SCCs")
+			}
+			componentOf[id] = index
+		}
+		if err := verifyClaimedTrees(state, claim, threshold); err != nil {
+			return err
+		}
+	}
+	if len(componentOf) != len(included) {
+		return fmt.Errorf("claimed SCC partition is incomplete")
+	}
+
+	condensation := make(map[int][]int, len(part))
+	seenCross := make(map[[2]int]bool)
+	ids := sortedSet(included)
+	for i := 0; i < len(ids); i++ {
+		for j := i + 1; j < len(ids); j++ {
+			u, v := ids[i], ids[j]
+			if state.QueryCounts != nil {
+				state.QueryCounts.InternalPairs++
+			}
+			from, to, exists := selectedEdge(state, u, v, threshold)
+			if !exists {
+				continue
+			}
+			fromComponent, toComponent := componentOf[from], componentOf[to]
+			if fromComponent == toComponent {
+				continue
+			}
+			if fromComponent >= toComponent {
+				return fmt.Errorf("cross-component edge does not increase rank")
+			}
+			key := [2]int{fromComponent, toComponent}
+			if !seenCross[key] {
+				seenCross[key] = true
+				condensation[fromComponent] = append(condensation[fromComponent], toComponent)
+			}
+		}
+	}
+	for index := range part {
+		if _, ok := condensation[index]; !ok {
+			condensation[index] = nil
+		}
+	}
+	infos := make(map[int]types.SCCInfo, len(part))
+	selectedComponents := make(map[int]bool, len(part))
+	for index, claim := range part {
+		infos[index] = types.SCCInfo{ID: index, Txs: claim.Transactions, IsSolid: true}
+		selectedComponents[index] = true
+	}
+	ordered := topoSortCondensation(condensation, infos, selectedComponents)
+	for rank, component := range ordered {
+		if component != rank {
+			return fmt.Errorf("claimed ranks do not match deterministic Kahn order")
+		}
+	}
+
+	return nil
+}
+
+func retireEvidence(state *EvidenceState, manager *DependencyManager, finalized map[types.TxID]bool) {
+	if len(finalized) == 0 {
+		return
+	}
+	for id := range finalized {
+		delete(state.Live, id)
+		delete(state.TxRef, id)
+		delete(state.visibility, id)
+		delete(state.states, id)
+		delete(state.SolidSince, id)
+		for _, positions := range state.Pos {
+			delete(positions, id)
+		}
+	}
+	for key := range state.weights {
+		if finalized[key.u] || finalized[key.v] {
+			delete(state.weights, key)
+		}
+	}
+	manager.removeFinalized(finalized)
 }

@@ -561,6 +561,7 @@ func TestFirstReceiptOrderSurvivesBlockedAdmission(t *testing.T) {
 func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testing.T) {
 	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
 	service := &OFOService{
+		auth: newTestAuthenticator(t, 5), admission: newTestAdmission(), authContext: types.AuthContext{Epoch: 1}, loMaxSize: 10,
 		committed:          NewEvidenceState(1, 5, [32]byte{}),
 		pipelineCtx:        pipelineCtx,
 		pipelineCancel:     pipelineCancel,
@@ -578,7 +579,7 @@ func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testin
 	}()
 
 	for sender := uint64(1); sender < 5; sender++ {
-		service.localOrderChan <- &types.LocalOrder{ReplicaID: sender, FragmentSeq: 1}
+		service.localOrderChan <- signedOrder(t, service.auth, service.committed, sender, 1)
 	}
 	select {
 	case batch := <-service.batchReadyChan:
@@ -590,7 +591,7 @@ func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testin
 	}
 
 	for sender := uint64(1); sender < 5; sender++ {
-		service.localOrderChan <- &types.LocalOrder{ReplicaID: sender, FragmentSeq: 1}
+		service.localOrderChan <- signedOrder(t, service.auth, service.committed, sender, 1)
 	}
 	select {
 	case batch := <-service.batchReadyChan:
@@ -608,7 +609,7 @@ func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testin
 	}
 
 	for _, sender := range []uint64{2, 3, 4, 0} {
-		service.localOrderChan <- &types.LocalOrder{ReplicaID: sender, FragmentSeq: 2}
+		service.localOrderChan <- signedOrder(t, service.auth, service.committed, sender, 2)
 	}
 	select {
 	case batch := <-service.batchReadyChan:
@@ -625,6 +626,8 @@ func TestCollectorWaitsForRoundOutcomeAndDropsCommittedRetransmissions(t *testin
 	}
 }
 
+// An omitted extension is retained as a prefix: before admission the replica
+// may only replace it with a longer extension of the same committed position.
 func TestOmittedLocalOrderRetainsChunk(t *testing.T) {
 	auth := newTestAuthenticator(t, 5)
 	admission := newTestAdmission()
@@ -646,16 +649,31 @@ func TestOmittedLocalOrderRetainsChunk(t *testing.T) {
 	s.committed.FragmentSeq = 1
 	s.applyCommittedLocalOrder(nil)
 	s.GenerateAndSendLocalOrder()
-	if len(sent) != 2 || !sameIDs(sent[0].OrderedTxs, sent[1].OrderedTxs) || len(sent[1].OrderedTxs) != 1 || sent[1].FragmentSeq != 2 || sent[0].NewHead != sent[1].NewHead {
-		t.Fatal("omitted chunk was resampled or not re-signed for the next sequence")
+	if len(sent) != 2 || len(sent[1].OrderedTxs) != 2 || sent[1].OrderedTxs[0] != sent[0].OrderedTxs[0] || sent[1].FragmentSeq != 2 ||
+		sent[1].PrevPosition != sent[0].PrevPosition || sent[1].PrevHead != sent[0].PrevHead {
+		t.Fatal("omitted chunk was dropped, reordered, or not extended from the same committed position")
 	}
 	if !auth.VerifyReplica(1, types.LocalOrderDigest(sent[1]), sent[1].Signature) {
-		t.Fatal("invalid renewed signature")
+		t.Fatal("invalid refreshed signature")
 	}
-	s.GenerateAndSendLocalOrder() // Ordinary pending retransmission reuses that signature.
+	s.GenerateAndSendLocalOrder() // Nothing new: ordinary retransmission reuses that signature.
+	if len(sent) != 3 || types.LocalOrderDigest(sent[2]) != types.LocalOrderDigest(sent[1]) {
+		t.Fatal("pending extension was not retransmitted unchanged")
+	}
 	stats := s.Benchmark.Report(1)
-	if stats.Counts["lo_fresh"] != 1 || stats.Counts["lo_retransmit_attempts"] != 2 || stats.Counts["lo_signatures"] != 2 {
-		t.Fatalf("fresh/re-sign/retransmit accounting is incorrect: %+v", stats)
+	if stats.Counts["lo_fresh"] != 2 || stats.Counts["lo_refresh"] != 1 || stats.Counts["lo_retransmit_attempts"] != 1 || stats.Counts["lo_signatures"] != 2 {
+		t.Fatalf("fresh/refresh/retransmit accounting is incorrect: %+v", stats)
+	}
+	// Committing the shorter first version consumes the pending predecessor;
+	// the position beyond it is reported in the next extension.
+	short := sent[0]
+	s.committed.Seq[1], s.committed.Head[1] = short.NewPosition, short.NewHead
+	s.committed.FragmentSeq = 2
+	s.applyCommittedLocalOrder([]*types.LocalOrder{short})
+	s.GenerateAndSendLocalOrder()
+	last := sent[len(sent)-1]
+	if last.PrevPosition != short.NewPosition || len(last.OrderedTxs) != 1 || last.OrderedTxs[0] != sent[1].OrderedTxs[1] {
+		t.Fatal("remaining position after a shorter committed version was lost")
 	}
 }
 

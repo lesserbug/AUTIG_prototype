@@ -15,13 +15,15 @@ import (
 // All ablation implementations are test-only. Keep the full-path wrappers in
 // step with service.go; differential tests exercise their state effects.
 type ablationCase struct {
-	name           string
-	history, fresh int
-	loMaxSize      int // zero uses the main benchmark's current limit, 200
-	cycle, release bool
-	delayed        bool
-	blocked        bool
-	partialRelease bool // release a small historical prefix, retaining the backlog
+	name              string
+	history, fresh    int
+	loMaxSize         int // zero uses the main benchmark's current limit, 200
+	cycle, release    bool
+	delayed           bool
+	blocked           bool
+	partialRelease    bool // release a small historical prefix, retaining the backlog
+	continuation      bool // enable the v2 policy at genesis, including all warm-up commits
+	continuationDelay uint64
 }
 
 type ablationFixture struct {
@@ -86,6 +88,11 @@ func makeAblationFixture(t testing.TB, n, f uint64, gamma float64, c ablationCas
 	s, err := NewOFOService(0, n, f, gamma, newTestNetwork(), limit, nil, false, x.auth, x.admission, context, genesis, func(*types.VerifiableFairOrderFragment, [32]byte) {})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if c.continuation {
+		if err := s.EnableContinuation(c.continuationDelay); err != nil {
+			t.Fatal(err)
+		}
 	}
 	// Only synchronous local computation is under study; stop collector workers.
 	s.Stop()
@@ -293,7 +300,8 @@ func (x *ablationFixture) service(leader bool) *OFOService {
 		manager = s.UtigManager
 	}
 	return &OFOService{ReplicaID: r, isLeader: leader, auth: s.auth, admission: s.admission,
-		authContext: s.authContext, committed: s.committed, latestCommittedFragment: s.latestCommittedFragment,
+		continuationEnabled: s.continuationEnabled, continuationDelay: s.continuationDelay, policyID: s.policyID,
+		authContext: s.authContext, committed: cloneForTestReplica(s.committed), latestCommittedFragment: s.latestCommittedFragment,
 		UtigManager: manager, replicaCount: s.replicaCount, fFaulty: s.fFaulty, gamma: s.gamma, loMaxSize: s.loMaxSize}
 }
 
@@ -393,6 +401,10 @@ func assertAblationState(t testing.TB, a, b *EvidenceState) {
 	// produced by these execution paths have the same canonical value domain.
 	a, b = a.clone(), b.clone()
 	for _, s := range []*EvidenceState{a, b} {
+		s.QueryCounts = nil
+		s.Done = s.doneEntries()
+		s.doneBase, s.doneOrder = nil, nil
+		s.doneVersion, s.doneBaseCount = 0, 0
 		for k, w := range s.weights {
 			if w == 0 {
 				delete(s.weights, k)
@@ -442,7 +454,7 @@ func ablationMetrics(x *ablationFixture) map[string]float64 {
 		for _, name := range []string{"blank", "shaded", "solid", "positions", "max_positions", "edges", "scc", "max_scc", "nontrivial_scc"} {
 			m[p+name] = 0
 		}
-		m[p+"live"], m[p+"done"] = float64(len(s.Live)), float64(len(s.Done))
+		m[p+"live"], m[p+"done"] = float64(len(s.Live)), float64(s.doneCount())
 		m[p+"weights"] = float64(len(s.weights))
 		for _, positions := range s.Pos {
 			m[p+"positions"] += float64(len(positions))

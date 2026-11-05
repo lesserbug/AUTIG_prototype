@@ -352,7 +352,7 @@ func runOrdering(t testing.TB, trace orderingTrace, f, byzantine uint64, gamma f
 		}
 		if len(fixedSenders) > 0 {
 			for _, tx := range trace.txs {
-				if leader.committed.Done[tx.ID].BatchIndex == 0 {
+				if leader.committed.doneEntries()[tx.ID].BatchIndex == 0 {
 					t.Fatal("full-input matched proposal did not finalize every transaction")
 				}
 			}
@@ -370,7 +370,7 @@ func runOrdering(t testing.TB, trace orderingTrace, f, byzantine uint64, gamma f
 	}
 	batchSizes := make(map[uint64]int)
 	for i, tx := range trace.txs {
-		result.Batches[i] = leader.committed.Done[tx.ID].BatchIndex
+		result.Batches[i] = leader.committed.doneEntries()[tx.ID].BatchIndex
 		if result.Batches[i] > 0 {
 			batchSizes[result.Batches[i]]++
 		}

@@ -52,7 +52,7 @@ func applyEvidenceReference(state *EvidenceState, orders []*types.LocalOrder, ep
 				return nil, nil, fmt.Errorf("duplicate identifier in replica %d extension", order.ReplicaID)
 			}
 			seen[id] = true
-			if _, finalized := state.Done[id]; finalized {
+			if _, finalized := state.doneLookup(id); finalized {
 				continue
 			}
 			if _, exists := state.Pos[order.ReplicaID][id]; exists {
@@ -87,7 +87,7 @@ func applyEvidenceReference(state *EvidenceState, orders []*types.LocalOrder, ep
 		position := order.PrevPosition
 		for _, id := range order.OrderedTxs {
 			position++
-			if _, finalized := state.Done[id]; finalized {
+			if _, finalized := state.doneLookup(id); finalized {
 				continue
 			}
 			if !state.Live[id] {

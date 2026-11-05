@@ -15,6 +15,9 @@ import (
 // Done records follow that prefix. Empty padding fixes the next sender schedule.
 // Live-state setup and measured proposals use the production paths below.
 func makeHistorySizeFixture(t testing.TB, done int) *ablationFixture {
+	return makeHistorySizeFixtureMode(t, done, false)
+}
+func makeHistorySizeFixtureMode(t testing.TB, done int, continuation bool) *ablationFixture {
 	t.Helper()
 	const historyRounds = 5000 // Cover 10^6 IDs while fixing the source sequence at every size.
 	x := &ablationFixture{auth: newAblationAuthenticator(10, 7), admission: newTestAdmission()}
@@ -26,6 +29,11 @@ func makeHistorySizeFixture(t testing.TB, done int) *ablationFixture {
 		t.Fatal(err)
 	}
 	x.base.Stop()
+	if continuation {
+		if err := x.base.EnableContinuation(2); err != nil {
+			t.Fatal(err)
+		}
+	}
 	s := x.base.committed
 	for seq := uint64(1); seq <= historyRounds; seq++ {
 		var ids []types.TxID
@@ -41,15 +49,22 @@ func makeHistorySizeFixture(t testing.TB, done int) *ablationFixture {
 			index := s.FairnessBatchCounter + uint64(i) + 1
 			output.Batches = append(output.Batches, types.FairnessBatch{Index: index, Transactions: []types.TxID{id}})
 			cert.Part = append(cert.Part, types.SCCClaim{Rank: uint64(i), Transactions: []types.TxID{id}})
-			s.Done[id] = DoneRecord{FragmentSeq: seq, BatchIndex: index}
+			s.addDone(id, DoneRecord{FragmentSeq: seq, BatchIndex: index, ExecutionSeq: seq, ExecutionOrdinal: uint64(i) + 1})
 		}
 		preID := types.PreStateIdentifier(ctx.Epoch, seq, s.StateID, types.EvidenceBatchDigest(orders))
 		postID := types.PostStateIdentifier(ctx.Epoch, seq, preID, output, cert.Part)
+		if continuation {
+			postID = types.ContinuationStateIdentifier(ctx.Epoch, seq, preID, x.base.policyID, output, nil, s.DoneRoot)
+		}
 		fragment := &types.VerifiableFairOrderFragment{
 			Epoch: ctx.Epoch, LeaderID: ctx.LeaderID, AuthContextID: ctx.Identifier, FragmentSeq: seq,
 			PreviousStateID: s.StateID, PreviousFragmentDigest: x.base.latestCommittedFragment,
 			Evidence: orders, FinalOrder: output, Certificate: cert,
 			CandidateEvidenceStateID: preID, CandidatePostStateID: postID,
+		}
+		if continuation {
+			fragment.ProtocolVersion = 2
+			fragment.PolicyID = x.base.policyID
 		}
 		x.base.latestCommittedFragment = types.FragmentDigest(fragment)
 		s.StateID, s.FragmentSeq = postID, seq
@@ -58,7 +73,9 @@ func makeHistorySizeFixture(t testing.TB, done int) *ablationFixture {
 			s.Seq[order.ReplicaID], s.Head[order.ReplicaID] = order.NewPosition, order.NewHead
 		}
 	}
-	s.DoneRoot = finalizedSetRoot(s.Done)
+	if !s.commitDone() {
+		t.Fatal("history seed commit")
+	}
 
 	// Seven reporters leave 128 ordered transactions Shaded (Solid threshold 8).
 	// In the measured round replica 0 releases the first eight; the other eight
@@ -100,11 +117,11 @@ func TestHistorySizeFixture(t *testing.T) {
 		t.Run(fmt.Sprintf("Done%d", done), func(t *testing.T) {
 			x := makeHistorySizeFixture(t, done)
 			pre, post := x.base.committed, x.candidate.postState
-			if len(pre.Done) != done || pre.DoneRoot != finalizedSetRoot(pre.Done) || pre.FairnessBatchCounter != uint64(done) ||
-				len(pre.Live) != 128 || len(x.candidate.preState.Live) != 136 || len(post.Live) != 128 || len(post.Done) != done+8 || len(x.candidate.fragment.FinalOrder.Batches) != 8 {
+			if pre.doneCount() != done || pre.DoneRoot != finalizedSetRoot(pre.doneEntries()) || pre.FairnessBatchCounter != uint64(done) ||
+				len(pre.Live) != 128 || len(x.candidate.preState.Live) != 136 || len(post.Live) != 128 || post.doneCount() != done+8 || len(x.candidate.fragment.FinalOrder.Batches) != 8 {
 				t.Fatal("history, live or output size differs from the controlled workload")
 			}
-			for id, record := range pre.Done {
+			for id, record := range pre.doneEntries() {
 				if pre.Live[id] || record.BatchIndex == 0 || record.BatchIndex > uint64(done) || record.FragmentSeq != (record.BatchIndex-1)/200+1 {
 					t.Fatal("historical records do not match the synthetic prefix")
 				}
@@ -240,13 +257,13 @@ func TestHistoryContinuousCommit(t *testing.T) {
 		commitTime := time.Since(start)
 		done += len(backlog)
 		if !reflect.DeepEqual(leader.committed, follower.committed) || leader.committed.FragmentSeq != seq ||
-			len(leader.committed.Done) != done || leader.committed.FairnessBatchCounter != uint64(done) ||
+			leader.committed.doneCount() != done || leader.committed.FairnessBatchCounter != uint64(done) ||
 			len(leader.committed.Live) != len(next) || leader.latestCommittedFragment != candidate.digest || follower.latestCommittedFragment != candidate.digest ||
 			leader.authContext != ctx || follower.authContext != ctx || leader.pending != nil || follower.pending != nil {
 			t.Fatalf("round %d committed prefix, live size or authorization diverged", seq)
 		}
 		if sample {
-			if len(backlog) != 64 || len(next) != 64 || leader.committed.DoneRoot != finalizedSetRoot(leader.committed.Done) {
+			if len(backlog) != 64 || len(next) != 64 || leader.committed.DoneRoot != finalizedSetRoot(leader.committed.doneEntries()) {
 				t.Fatal("observation does not have the fixed workload or a matching DoneRoot")
 			}
 			runtime.ReadMemStats(&memory)
@@ -287,7 +304,7 @@ func BenchmarkHistorySize(b *testing.B) {
 						case "Clone":
 							result = s.committed.clone()
 						case "DoneRoot":
-							result = finalizedSetRoot(s.committed.Done)
+							result = finalizedSetRoot(s.committed.doneEntries())
 						}
 						b.StopTimer()
 						runtime.KeepAlive(result)

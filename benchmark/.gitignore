@@ -1,5 +1,0 @@
-.build/
-.runtime/
-__pycache__/
-logs/
-results/

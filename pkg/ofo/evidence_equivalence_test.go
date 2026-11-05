@@ -35,8 +35,8 @@ func makeEvidenceFixture(t testing.TB, n uint64, oldCount, newCount int, seed in
 	// Finalized IDs consume LO positions but must not become live or contribute
 	// weights again, even when they occur in extensions of several replicas.
 	dead := ids[len(ids)-1]
-	state.Done[dead] = DoneRecord{FragmentSeq: 0, BatchIndex: 0}
-	state.DoneRoot = finalizedSetRoot(state.Done)
+	state.addDone(dead, DoneRecord{FragmentSeq: 0, BatchIndex: 0})
+	state.DoneRoot = finalizedSetRoot(state.doneEntries())
 	var warm []*types.LocalOrder
 	for r := uint64(0); r < n-1; r++ {
 		old := append([]types.TxID(nil), ids[:oldCount]...)
