@@ -1,0 +1,44 @@
+{
+  "testbed": "autig-benchmark",
+  "user": "ubuntu",
+  "key": {
+    "name": "YOUR_EC2_KEY_PAIR_NAME",
+    "path": "YOUR_LOCAL_SSH_KEY_PATH"
+  },
+  "port": 5000,
+  "repo": {
+    "name": "autig",
+    "url": "https://github.com/lesserbug/AUTIG_prototype.git",
+    "branch": "main"
+  },
+  "instances": {
+    "type": "m5.xlarge",
+    "regions": ["us-east-1"]
+  },
+  "benchmark": {
+    "local": {
+      "nodes": 5,
+      "faults": 1,
+      "gamma": 1.0,
+      "byzantine_count": 0,
+      "rate": 50,
+      "duration": 5,
+      "continuation_delay": 2,
+      "verification_mode": "certificate"
+    },
+    "remote": {
+      "nodes": [5],
+      "faults": 1,
+      "gamma": 1.0,
+      "byzantine_count": [0],
+      "rate": [100, 300, 500, 700],
+      "tx_size": 512,
+      "lo_interval": 150,
+      "lo_size": 200,
+      "duration": 60,
+      "runs": 3,
+      "continuation_delay": 2,
+      "verification_mode": "certificate"
+    }
+  }
+}

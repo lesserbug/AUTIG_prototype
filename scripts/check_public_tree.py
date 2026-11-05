@@ -6,9 +6,11 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_SUFFIXES = {".go", ".mod", ".sum", ".md", ".py"}
-ALLOWED_NAMES = {".gitignore", "config.example.json", "LICENSE", "NOTICE", "COPYING"}
+ALLOWED_NAMES = {".gitignore", "config.example.json", "settings.example.json",
+                 "requirements.txt", "LICENSE", "NOTICE", "COPYING"}
 GENERATED_DIRS = {".git", "__pycache__", ".venv", "go-cache", "go-mod-cache",
-                  "keys", "runtime", "comet_nodes", "results", "logs"}
+                  "keys", "runtime", "comet_nodes", "results", "logs",
+                  ".build", ".runtime", ".benchmark"}
 PATTERNS = {
     "serialized private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"),
     "cloud access identifier": re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),

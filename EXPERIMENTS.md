@@ -3,6 +3,12 @@
 Run commands from the repository root. Output files are generated locally;
 the source package contains no previous measurement results.
 
+## AWS and networked ordering
+
+The Fabric tasks support local, single-region and multi-region runs of the
+standalone ordering layer. See [benchmark/README.md](benchmark/README.md) for
+configuration and the `fab local`, `fab remote` and `fab logs` commands.
+
 ## Build and regression checks
 
 ```sh
@@ -114,9 +120,8 @@ peer-query routine encounters a closed LevelDB during shutdown after the
 checked result has been written, the output is preserved with a distinct
 shutdown annotation. Other failures stop the runner.
 
-The standalone ordering driver in README can also run on separately configured
-hosts. Set endpoints and locally generated credential paths in an untracked
-configuration file.
+The AWS Fabric tasks configure the standalone driver for separately hosted
+replicas and collect their logs; see the deployment guide linked above.
 
 ## Checking the publication tree
 

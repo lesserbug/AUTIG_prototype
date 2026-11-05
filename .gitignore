@@ -1,6 +1,13 @@
 # Local credentials and machine-specific configuration
 /config.json
 /keys/
+/benchmark/settings.json
+/benchmark/.build/
+/benchmark/.runtime/
+/benchmark/logs/
+/benchmark/results/
+/.benchmark/
+/autig
 **/*.pem
 **/*.key
 **/*.p12
