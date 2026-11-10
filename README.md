@@ -42,5 +42,4 @@ control.
 ## Experiments
 
 See [EXPERIMENTS.md](EXPERIMENTS.md) for validation benchmarks, fairness replay
-and model checking. The [CometBFT integration](comet_integration/README.md)
-provides an additional check of BFT commitment and native-state agreement.
+and model checking.
