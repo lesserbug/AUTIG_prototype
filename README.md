@@ -1,56 +1,46 @@
 # AUTIG
 
 AUTIG is a Go prototype of graph-based fair ordering for Byzantine
-fault-tolerant systems. It separates authenticated receipt evidence from
-dependency-graph computation: the ordering leader maintains an incremental
-graph, while followers validate structural certificates. Certified continuation
-supports transaction progress under continuing arrivals.
+fault-tolerant systems. It uses replicas' authenticated transaction-receipt
+observations to constrain ordering and separates the evidence that defines a
+valid order from the graph used to compute it.
+
+The ordering leader incrementally maintains an Unconfirmed-Transaction
+Incremental Graph (UTIG). Followers verify structural certificates for the
+exact closed output, including its predecessors and justified exclusions,
+without maintaining the leader's graph. Certified continuation supports
+transaction progress under continuing arrivals, and the commit interface
+installs a verified candidate only when its exact digest is committed.
 
 This repository contains the AUTIG implementation, AWS deployment scripts,
 a Themis-style reference, CometBFT integration, and supporting tests.
 
 ## Quick start
 
-Requirements: Go 1.24.5 or newer and Python 3.10 or newer.
-Run the following commands from the repository root:
+Requirements: Go 1.24.5 or newer and Python 3.10 or newer for the experiment
+scripts. Run the AUTIG tests from the repository root:
 
 ```sh
-python scripts/reproduce.py check
+go test -short -count=1 ./...
 ```
 
 ## AWS deployment
 
-Fabric supports local runs and single-region or multi-region AWS experiments:
-
-```sh
-python -m pip install -r benchmark/requirements.txt
-cd benchmark
-cp settings.example.json settings.json
-```
-
-Configure your EC2 key pair, regions and workload in `settings.json`, and set
-up AWS credentials through a local profile or environment variables. With the
-configured EC2 instances running:
+Fabric supports local runs and single-region or multi-region AWS deployment.
+Follow [benchmark/README.md](benchmark/README.md) to install the dependencies
+and configure local settings and AWS access. From `benchmark/`:
 
 ```sh
 fab local
-fab info
-fab install
 fab remote
 fab logs
 ```
 
-See [benchmark/README.md](benchmark/README.md) for setup, instance provisioning
-and workload options. Local configuration, keys and generated outputs are
-excluded from version control.
+Local configuration, keys and generated outputs are excluded from version
+control.
 
-## CometBFT and other experiments
+## Experiments
 
-From the repository root, run a local CometBFT integration check:
-
-```sh
-python scripts/reproduce.py smoke --committee 10
-```
-
-See [EXPERIMENTS.md](EXPERIMENTS.md) for validation benchmarks, fairness replay,
-model checking and CometBFT experiments.
+See [EXPERIMENTS.md](EXPERIMENTS.md) for validation benchmarks, fairness replay
+and model checking. The [CometBFT integration](comet_integration/README.md)
+provides an additional check of BFT commitment and native-state agreement.

@@ -77,51 +77,19 @@ The checker covers three- and four-transaction families and a five-replica
 Byzantine family. It also evaluates an identifier-order reference rule as an
 oracle control. The report distinguishes that rule from certified execution.
 
-## Committed CometBFT execution
+## CometBFT integration
 
-A short composition run:
+The integration checks BFT commitment and native-state agreement. Run a short
+check or the five- and ten-validator experiment matrices:
 
 ```sh
 python scripts/reproduce.py smoke --committee 10
-```
-
-The complete matrices:
-
-```sh
 python scripts/reproduce.py comet --committee 5
 python scripts/reproduce.py comet --committee 10
 ```
 
-| Configuration | Five validators | Ten validators |
-| --- | --- | --- |
-| Fault budget | 1 | 2 |
-| Fairness parameter | 1 | 1 |
-| Assignment delay | 2 fragments | 2 fragments |
-| Transactions per run | 3,000 | 3,000 |
-| Nominal issue rate | 200/s | 100/s |
-| Disagreement | 0.1, 100 | 0.1, 100 |
-| Seeds | 1, 7, 19 | 1, 7, 19 |
-| Modes | Certificate, retained/undo, reconstruction, Themis-style | Certificate, reconstruction, Themis-style |
-
-The matrices are separate within-committee comparisons. All modes within one
-configuration share the workload settings, report interval, admission limits
-and commit interface. Actual issue rate, all-transaction execution latency,
-drain throughput, serialized record size, ABCI validation time, completion and
-native-state agreement are recorded by the driver.
-
-Follower validation work is total validation wall time across native followers
-divided by their total nonempty committed-block count. It includes first
-validation and repeated checks of the same pending candidate across ABCI hooks.
-Receipt reports and transaction contents use the local adapter; validator
-consensus traffic uses TCP loopback.
-
-The runner records the original process exit code. If the CometBFT background
-peer-query routine encounters a closed LevelDB during shutdown after the
-checked result has been written, the output is preserved with a distinct
-shutdown annotation. Other failures stop the runner.
-
-The AWS Fabric tasks configure the standalone driver for separately hosted
-replicas and collect their logs; see the deployment guide linked above.
+See [comet_integration/README.md](comet_integration/README.md) for configuration
+and measurement details.
 
 ## Checking the publication tree
 
